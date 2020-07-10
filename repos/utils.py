@@ -17,8 +17,12 @@
 
 from __future__ import unicode_literals
 
+import os
+import git
 import re
+import shutil
 import tarfile
+import tempfile
 try:
     import lzma
 except ImportError:
@@ -31,9 +35,10 @@ from io import BytesIO
 from defusedxml.lxml import _etree as etree
 from debian.debian_support import Version
 from debian.deb822 import Packages
+from fnmatch import fnmatch
 
 from django.conf import settings
-from django.db import transaction
+from django.db import transaction, IntegrityError, DatabaseError
 from django.db.models import Q
 from django.utils.six import text_type
 
@@ -43,6 +48,28 @@ from util import get_url, download_url, response_is_valid, extract, \
     get_sha1, get_sha256
 from patchman.signals import progress_info_s, progress_update_s, \
     info_message, warning_message, error_message, debug_message
+
+
+def get_or_create_repo(r_name, r_arch, r_type):
+    """ Get or create a Repository object. Returns the object. Returns None if
+        it cannot get or create the object.
+    """
+    from repos.models import Repository
+    repositories = Repository.objects.all()
+    try:
+        with transaction.atomic():
+            repository, c = repositories.get_or_create(name=r_name,
+                                                       arch=r_arch,
+                                                       repotype=r_type)
+    except IntegrityError as e:
+        error_message.send(sender=None, text=e)
+        repository = repositories.get(name=r_name,
+                                      arch=r_arch,
+                                      repotype=r_type)
+    except DatabaseError as e:
+        error_message.send(sender=None, text=e)
+    if repository:
+        return repository
 
 
 def update_mirror_packages(mirror, packages):
@@ -184,6 +211,63 @@ def find_mirror_url(stored_mirror_url, formats):
             return res
 
 
+def get_gentoo_mirror_urls():
+    """ Use the Gentoo API to find http(s) mirrors
+    """
+    res = get_url('https://api.gentoo.org/mirrors/distfiles.xml')
+    if not res:
+        return
+    mirrors = {}
+    tree = etree.parse(BytesIO(res.content))
+    root = tree.getroot()
+    for child in root:
+        if child.tag == 'mirrorgroup':
+            for k, v in child.attrib.items():
+                if k == 'region':
+                    region = v
+                elif k == 'country':
+                    country = v
+            for mirror in child:
+                for element in mirror:
+                    if element.tag == 'name':
+                        name = element.text
+                        mirrors[name] = {}
+                        mirrors[name]['region'] = region
+                        mirrors[name]['country'] = country
+                        mirrors[name]['urls'] = []
+                    elif element.tag == 'uri':
+                        if element.get('protocol') == 'http':
+                            mirrors[name]['urls'].append(element.text)
+    mirror_urls = []
+    # ignore region data and choose MAX_MIRRORS mirrors at random
+    # TODO: allow choosing mirror by region
+    for _, v in mirrors.items():
+        for url in v['urls']:
+            mirror_urls.append(url.rstrip('/') + '/snapshots/gentoo-latest.tar.xz')
+    return mirror_urls
+
+
+def get_gentoo_overlay_mirrors(repo_name):
+    """Get the gentoo overlay repos that match repo.id
+    """
+    res = get_url('https://api.gentoo.org/overlays/repositories.xml')
+    if not res:
+        return
+    tree = etree.parse(BytesIO(res.content))
+    root = tree.getroot()
+    mirrors = []
+    for child in root:
+        if child.tag == 'repo':
+            found = False
+            for element in child:
+                if element.tag == 'name' and element.text == repo_name:
+                    found = True
+                if found and element.tag == 'source':
+                    if element.text.startswith('http'):
+                        mirrors.append(element.text)
+    return mirrors
+
+
 def is_metalink(url):
     """ Checks if a given url is a metalink url
     """
@@ -227,26 +311,26 @@ def get_mirrorlist_urls(url):
                 return mirror_urls
 
 
-def add_mirrors_from_urls(mirror, mirror_urls):
+def add_mirrors_from_urls(repo, mirror_urls):
     """ Creates mirrors from a list of mirror urls
     """
     for mirror_url in mirror_urls:
         mirror_url = mirror_url.decode('ascii')
-        mirror_url = mirror_url.replace('$ARCH', mirror.repo.arch.name)
-        mirror_url = mirror_url.replace('$basearch', mirror.repo.arch.name)
+        mirror_url = mirror_url.replace('$ARCH', repo.arch.name)
+        mirror_url = mirror_url.replace('$basearch', repo.arch.name)
         if hasattr(settings, 'MAX_MIRRORS') and \
                 isinstance(settings.MAX_MIRRORS, int):
             max_mirrors = settings.MAX_MIRRORS
             # only add X mirrors, where X = max_mirrors
             q = Q(mirrorlist=False, refresh=True)
-            existing = mirror.repo.mirror_set.filter(q).count()
+            existing = repo.mirror_set.filter(q).count()
             if existing >= max_mirrors:
                 text = '{0!s} mirrors already '.format(max_mirrors)
                 text += 'exist, not adding {0!s}'.format(mirror_url)
                 warning_message.send(sender=None, text=text)
                 continue
         from repos.models import Mirror
-        m, c = Mirror.objects.get_or_create(repo=mirror.repo, url=mirror_url)
+        m, c = Mirror.objects.get_or_create(repo=repo, url=mirror_url)
         if c:
             text = 'Added mirror - {0!s}'.format(mirror_url)
             info_message.send(sender=None, text=text)
@@ -264,7 +348,7 @@ def check_for_mirrorlists(repo):
             mirror.save()
             text = 'Found mirrorlist - {0!s}'.format(mirror.url)
             info_message.send(sender=None, text=text)
-            add_mirrors_from_urls(mirror, mirror_urls)
+            add_mirrors_from_urls(repo, mirror_urls)
 
 
 def check_for_metalinks(repo):
@@ -282,7 +366,7 @@ def check_for_metalinks(repo):
             mirror.save()
             text = 'Found metalink - {0!s}'.format(mirror.url)
             info_message.send(sender=None, text=text)
-            add_mirrors_from_urls(mirror, mirror_urls)
+            add_mirrors_from_urls(repo, mirror_urls)
 
 
 def extract_yum_packages(data, url):
@@ -559,6 +643,89 @@ def refresh_arch_repo(repo):
         mirror.save()
 
 
+def refresh_gentoo_main_repo(repo):
+    """ Refresh all mirrors of the main gentoo repo
+    """
+    mirrors = get_gentoo_mirror_urls()
+    add_mirrors_from_urls(repo, mirrors)
+    # http://gentoo.mirrors.tera-byte.com/snapshots/gentoo-latest.tar.xz
+    # http://gentoo.mirrors.tera-byte.com/snapshots/gentoo-latest.tar.xz.md5sum
+
+
+def refresh_gentoo_overlay_repo(repo):
+    """ Refresh all mirrors of a Gentoo overlay repo
+    """
+    mirrors = get_gentoo_overlay_mirrors(repo.repo_id)
+    add_mirrors_from_urls(repo, mirrors)
+
+
+def extract_gentoo_packages(mirror, data):
+    pass
+    # TODO process mirror packages
+
+
+def extract_gentoo_overlay_packages(mirror):
+    from packages.utils import find_evr
+    t = tempfile.mkdtemp()
+    git.Repo.clone_from(mirror.url, t, branch='master', depth=1)
+    packages = set()
+    package_arches = PackageArchitecture.objects.all()
+    with transaction.atomic():
+        arch, c = package_arches.get_or_create(name='any')
+    for root, dirs, files in os.walk(t):
+        for name in files:
+            if fnmatch(name, '*.ebuild'):
+                full_name = root.replace(t + '/', '')
+                p_category, p_name = full_name.split('/')
+                m = re.match(r'{0!s}-(.*)\.ebuild'.format(p_name), name)
+                if m:
+                    p_evr = m.group(1)
+                epoch, version, release = find_evr(p_evr)
+                package = PackageString(name=p_name.lower(),
+                                        epoch=epoch,
+                                        version=version,
+                                        release=release,
+                                        arch=arch,
+                                        packagetype='G')
+                packages.add(package)
+                print(p_category, p_name, p_evr)
+    shutil.rmtree(t)
+    return packages
+
+
+def refresh_gentoo_repo(repo):
+    """ Refresh a Gentoo repo
+    """
+    if repo.repo_id == 'gentoo':
+        repo_type = 'main'
+        refresh_gentoo_main_repo(repo)
+    else:
+        refresh_gentoo_overlay_repo(repo)
+        repo_type = 'overlay'
+    ts = datetime.now().replace(microsecond=0)
+    for mirror in repo.mirror_set.filter(mirrorlist=False, refresh=True):
+        res = get_url(mirror.url)
+        mirror.last_access_ok = response_is_valid(res)
+        if mirror.last_access_ok:
+            data = download_url(res, 'Downloading repo info (1/2):')
+            if data is None:
+                mirror.fail()
+                return
+            text = 'Found gentoo repo - {0!s}'.format(mirror.url)
+            info_message.send(sender=None, text=text)
+            if repo_type == 'main':
+                packages = extract_gentoo_packages(mirror, data)
+            elif repo_type == 'overlay':
+                packages = extract_gentoo_overlay_packages(mirror)
+            mirror.timestamp = ts
+            if packages:
+                update_mirror_packages(mirror, packages)
+            # TODO checksum
+        else:
+            mirror.fail()
+        mirror.save()
+
+
 def refresh_yast_repo(mirror, data):
     """ Refresh package metadata for a yast-style rpm mirror
         and add the packages to the mirror
@@ -642,6 +809,7 @@ def refresh_deb_repo(repo):
     if lzma is not None:
         formats.insert(0, 'Packages.xz')
 
+    ts = datetime.now().replace(microsecond=0)
     for mirror in repo.mirror_set.filter(refresh=True):
         res = find_mirror_url(mirror.url, formats)
         mirror.last_access_ok = response_is_valid(res)
@@ -662,7 +830,7 @@ def refresh_deb_repo(repo):
             else:
                 packages = extract_deb_packages(data, mirror_url)
                 mirror.last_access_ok = True
-                mirror.timestamp = datetime.now()
+                mirror.timestamp = ts
                 update_mirror_packages(mirror, packages)
                 mirror.file_checksum = sha1
                 packages.clear()
