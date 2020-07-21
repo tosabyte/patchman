@@ -18,7 +18,7 @@
 from __future__ import unicode_literals
 
 import re
-from defusedxml.lxml import _etree as etree
+from defusedxml import ElementTree as etree
 
 from django.conf import settings
 from django.db import IntegrityError, DatabaseError, transaction

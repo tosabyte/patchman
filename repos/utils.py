@@ -28,7 +28,7 @@ except ImportError:
         lzma = None
 from datetime import datetime
 from io import BytesIO
-from defusedxml.lxml import _etree as etree
+from defusedxml import ElementTree as etree
 from debian.debian_support import Version
 from debian.deb822 import Packages
 
@@ -141,15 +141,17 @@ def get_primary_url(mirror_url, data):
             return None, None, None
     ns = 'http://linux.duke.edu/metadata/repo'
     try:
-        context = etree.parse(BytesIO(data), etree.XMLParser())
-    except etree.XMLSyntaxError:
-        context = etree.parse(BytesIO(extract(data, 'gz')), etree.XMLParser())
-    location = context.xpath("//ns:data[@type='primary']/ns:location/@href",
-                             namespaces={'ns': ns})[0]
-    checksum = context.xpath("//ns:data[@type='primary']/ns:checksum",
+        context = etree.parse(BytesIO(data))
+    except Exception as e:
+        print('e')
+        print(e)
+        context = etree.parse(BytesIO(extract(data, 'gz')))
+    location = context.findall(".//ns:data[@type='primary']/ns:location/[@href]",
+                             namespaces={'ns': ns})[0].attrib['href']
+    checksum = context.findall(".//ns:data[@type='primary']/ns:checksum",
                              namespaces={'ns': ns})[0].text
-    csum_type = context.xpath("//ns:data[@type='primary']/ns:checksum/@type",
-                              namespaces={'ns': ns})[0]
+    csum_type = context.findall(".//ns:data[@type='primary']/ns:checksum/[@type]",
+                              namespaces={'ns': ns})[0].attrib['type']
     primary_url = str(mirror_url.rsplit('/', 2)[0]) + '/' + location
     return primary_url, checksum, csum_type
 
@@ -291,11 +293,10 @@ def extract_yum_packages(data, url):
 
     extracted = extract(data, url)
     ns = 'http://linux.duke.edu/metadata/common'
-    m_context = etree.iterparse(BytesIO(extracted),
-                                tag='{{{0!s}}}metadata'.format(ns))
+    m_context = etree.iterparse(BytesIO(extracted))
+    print(m_context, type(m_context))
     plen = int(next(m_context)[1].get('packages'))
-    p_context = etree.iterparse(BytesIO(extracted),
-                                tag='{{{0!s}}}package'.format(ns))
+    p_context = etree.iterparse(BytesIO(extracted))
     packages = set()
 
     if plen > 0:
